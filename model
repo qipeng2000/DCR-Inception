@@ -1,1 +1,185 @@
+from datetime import datetime
+import torch.nn as nn
+import torch
+from matplotlib import pyplot as plt
+from torch.utils.data import DataLoader
+from torchsummary import summary
+
+import transforms as transforms
+import numpy as np
+import os
+import utils
+from JointLoss import *
+from model import *
+
+use_cuda = torch.cuda.is_available()
+
+best_Test_acc = 0  # best PrivateTest accuracy
+best_Test_acc_epoch = 0
+start_epoch = 0  # start from epoch 0 or last checkpoint epoch
+
+learning_rate_decay_start = 90  # 50
+learning_rate_decay_every = 1  # 5
+learning_rate_decay_rate = 0.8  # 0.9
+
+cut_size = 96
+total_epoch = 300
+
+path = './save_models/DCR-Inception'
+
+# Data
+print('==> Preparing data..')
+transform_train = transforms.Compose([
+    transforms.Resize(112),
+    transforms.RandomCrop(cut_size),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+])
+
+transform_test = transforms.Compose([
+    transforms.Resize(112),
+    transforms.TenCrop(cut_size),
+    transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops])),
+])
+
+trainloader = torch.utils.data.DataLoader(trainset, batch_size=64, shuffle=True, num_workers=1)
+testloader = torch.utils.data.DataLoader(testset, batch_size=64, shuffle=False, num_workers=1)
+
+# Model
+print('==> Building model..')
+net = DCR-Inception()
+summary(net, (3, 96, 96))
+
+if use_cuda:
+    net.cuda()
+
+criterion = nn.CrossEntropyLoss()
+optimizer = Jiont_LOSS(net.parameters(), lr=opt.lr, momentum=0.9, weight_decay=5e-4)
+
+train_losses = []
+train_counter = []
+train_acc = []
+test_acc = []
+
+# Training
+
+
+def train(epoch):
+    step_loss = []
+    print('\nEpoch: %d' % epoch)
+    # global Train_acc
+    net.train()
+    train_loss = 0
+    correct = 0
+    total = 0
+
+    if epoch > learning_rate_decay_start >= 0:
+        frac = (epoch - learning_rate_decay_start) // learning_rate_decay_every
+        decay_factor = learning_rate_decay_rate ** frac
+        current_lr = opt.lr * decay_factor
+        utils.set_lr(optimizer, current_lr)  # set the decayed rate
+    else:
+        current_lr = opt.lr
+    print('learning_rate: %s' % str(current_lr))
+    for batch_idx, (inputs, targets) in enumerate(trainloader):
+        if use_cuda:
+            inputs, targets = inputs.cuda(), targets.cuda()
+        optimizer.zero_grad()
+        outputs = net(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        utils.clip_gradient(optimizer, 0.1)
+        optimizer.step()
+
+        # if batch_idx % 10 == 0:
+        step_loss.append(loss.item())
+
+        train_loss += loss.item()
+        _, predicted = torch.max(outputs.data, 1)
+        total += targets.size(0)
+        correct += predicted.eq(targets.data).cpu().sum()
+        print('Loss: %.3f | Acc: %.3f%% (%d/%d)' % (train_loss/(batch_idx+1), 100.*correct/total, correct, total))
+
+    sum_loss = 0
+    for i in step_loss:
+        sum_loss += i
+    train_losses.append(sum_loss / len(step_loss))
+    train_counter.append(epoch + 1)
+
+    # Train_acc = 100.*correct/total
+    # train_acc.append(Train_acc)
+
+
+def test(epoch):
+    global Test_acc
+    global best_Test_acc
+    global best_Test_acc_epoch
+    net.eval()
+    PrivateTest_loss = 0
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for batch_idx, (inputs, targets) in enumerate(testloader):
+            bs, ncrops, c, h, w = np.shape(inputs)
+            inputs = inputs.view(-1, c, h, w)
+
+            if use_cuda:
+                inputs, targets = inputs.cuda(), targets.cuda()
+            outputs = net(inputs)
+            outputs_avg = outputs.view(bs, ncrops, -1).mean(1)  # avg over crops
+
+            loss = criterion(outputs_avg, targets)
+            PrivateTest_loss += loss.item()
+            _, predicted = torch.max(outputs_avg.data, 1)
+            total += targets.size(0)
+            correct += predicted.eq(targets.data).cpu().sum()
+
+    # Save checkpoint.
+    Test_acc = 100.*correct/total
+    test_acc.append(Test_acc)
+
+    if Test_acc > best_Test_acc:
+        print('Saving..')
+        print("best_Test_acc: %0.3f" % Test_acc)
+        # if not os.path.isdir(opt.dataset + '_' + opt.model):
+        #     os.mkdir(opt.dataset + '_' + opt.model)
+        if not os.path.isdir(path):
+            os.mkdir(path)
+        torch.save(net.state_dict(), os.path.join(path, 'model_best.pth'))
+        best_Test_acc = Test_acc
+        best_Test_acc_epoch = epoch
+
+        if (epoch+1) % 10 == 0:
+            print('Saving...')
+            torch.save(net.state_dict(), os.path.join(path, 'model_{}.pth'.format(epoch + 1)))
+
+
+time_start = datetime.now()
+for epoch in range(start_epoch, total_epoch):
+    train(epoch)
+    test(epoch)
+
+time_over = datetime.now()
+train_time = time_over - time_start
+print('训练花费时长：', train_time)
+
+print("best_Test_acc: %0.3f" % best_Test_acc)
+print("best_Test_acc_epoch: %d" % best_Test_acc_epoch)
+
+# 绘图
+# 左图-loss
+fig = plt.figure(figsize=(18, 6))
+ax1 = plt.subplot(1, 2, 1)
+ax1.plot(train_counter, train_losses, color='blue')
+ax1.legend(['Train Loss'], loc='upper right')
+ax1.set_xlabel('training epoch')
+ax1.set_ylabel('train_loss')
+# ax1.axis('off')
+# 右图-acc
+ax2 = plt.subplot(1, 2, 2)
+ax2.plot(train_counter, test_acc, color='blue')
+ax2.legend(['Train Acc'], loc='upper right')
+ax2.set_xlabel('training epoch')
+ax2.set_ylabel('test_acc')
+plt.show()
 
