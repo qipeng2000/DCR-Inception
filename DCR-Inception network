@@ -1,0 +1,268 @@
+import netron
+import torch
+import torch.nn as nn
+from torchsummary import summary
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=3):
+        super(SpatialAttention, self).__init__()
+        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
+        padding = 3 if kernel_size == 7 else 1
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)  # 7,3     3,1
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+
+class CBAM(nn.Module):
+    def __init__(self, in_planes, ratio=16, kernel_size=3):
+        super(CBAM, self).__init__()
+        self.ca = ChannelAttention(in_planes, ratio)
+        self.sa = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        out = x * self.ca(x)
+        result = out * self.sa(out)
+        return result
+
+
+class CBAM_block(nn.Module):
+    def __init__(self, input_size, output_size):
+        super(CBAM_block, self).__init__()
+
+        self.conv = nn.Sequential(
+            nn.Conv2d(input_size, output_size, kernel_size=1),
+            nn.BatchNorm2d(output_size),
+            nn.ReLU(inplace=True))
+
+        self.cbam = CBAM(output_size, ratio=16, kernel_size=3)
+
+    def forward(self, x):
+        x = self.conv(x)
+        x = self.cbam(x)
+        return x
+
+
+class SeperableConv2d(nn.Module):
+
+    # ***Figure 4. An “extreme” version of our Inception module,
+    # with one spatial convolution per output channel of the 1x1
+    # convolution."""
+    def __init__(self, input_channels, output_channels, kernel_size, padding, **kwargs):
+
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            input_channels,
+            input_channels,
+            kernel_size,
+            padding=1,
+            groups=input_channels,
+            bias=False,
+            **kwargs
+        )
+
+        self.pointwise = nn.Conv2d(input_channels, output_channels, 1, bias=False)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+
+        return x
+
+
+class Inception(nn.Module):
+    def __init__(self, input_channels, n1x1, n3x3_reduce, n3x3, n5x5_reduce, n5x5, pool_proj):
+        super().__init__()
+
+        # 1x1conv branch
+        self.b1 = nn.Sequential(
+            nn.Conv2d(input_channels, n1x1, kernel_size=1),
+            nn.BatchNorm2d(n1x1),
+            nn.ReLU(inplace=True)
+        )
+
+        # 1x1conv -> 3x3conv branch
+        self.b2 = nn.Sequential(
+            nn.Conv2d(input_channels, n3x3_reduce, kernel_size=1),
+            nn.BatchNorm2d(n3x3_reduce),
+            nn.ReLU(inplace=True),
+            # nn.Conv2d(n3x3_reduce, n3x3, kernel_size=3, padding=1),
+            SeperableConv2d(n3x3_reduce, n3x3, kernel_size=3, padding=1),
+            nn.BatchNorm2d(n3x3),
+            nn.ReLU(inplace=True)
+        )
+
+        # 1x1conv -> 5x5conv branch
+        # we use 2 3x3 conv filters stacked instead
+        # of 1 5x5 filters to obtain the same receptive
+        # field with fewer parameters
+        self.b3 = nn.Sequential(
+            nn.Conv2d(input_channels, n5x5_reduce, kernel_size=1),
+            nn.BatchNorm2d(n5x5_reduce),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(n5x5_reduce, n5x5, kernel_size=5, padding=2),
+            # SeperableConv2d(n5x5_reduce, n5x5, kernel_size=3, padding=1),
+            nn.BatchNorm2d(n5x5, n5x5),
+            nn.ReLU(inplace=True)
+            # nn.Conv2d(n5x5, n5x5, kernel_size=3, padding=1),
+            # SeperableConv2d(n5x5, n5x5, kernel_size=3, padding=1),
+            # nn.BatchNorm2d(n5x5),
+            # nn.ReLU(inplace=True)
+        )
+
+        # 3x3pooling -> 1x1conv
+        # same conv
+        self.b4 = nn.Sequential(
+            nn.MaxPool2d(3, stride=1, padding=1),
+            nn.Conv2d(input_channels, pool_proj, kernel_size=1),
+            nn.BatchNorm2d(pool_proj),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        # print(self.b1(x).shape)
+        # print(self.b2(x).shape)
+        # print(self.b3(x).shape)
+        # print(self.b4(x).shape)
+        return torch.cat([self.b1(x), self.b2(x), self.b3(x), self.b4(x)], dim=1)
+
+
+class DCR_Inception(nn.Module):
+
+    def __init__(self, num_class=5):
+        super(DCR_VGG_Inception, self).__init__()
+
+        self.prelayer = nn.Sequential(
+            # 第一层
+            nn.Conv2d(3, 64, kernel_size=3, padding=1, bias=False),
+            # SeperableConv2d(3, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+
+            # CBAM
+            CBAM(64, 16, 7),
+
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            # SeperableConv2d(64, 64, kernel_size=3, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            # 第二层
+            nn.Conv2d(64, 192, kernel_size=3, padding=1, bias=False),
+            # SeperableConv2d(64, 192, kernel_size=3, padding=1),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+
+            # CBAM
+            CBAM(192, 16, 7),
+
+            nn.Conv2d(192, 192, kernel_size=3, padding=1, bias=False),
+            # SeperableConv2d(192, 192, kernel_size=3, padding=1),
+            nn.BatchNorm2d(192),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(3, stride=2, padding=1),
+            # nn.MaxPool2d(2, 2)
+        )
+        # 第三层
+        self.a3 = Inception(192, 64, 96, 128, 16, 32, 32)
+        self.b3 = Inception(256, 128, 128, 192, 32, 96, 64)
+
+        # 第四层
+        self.a4 = Inception(480, 192, 96, 208, 16, 48, 64)
+        self.b4 = Inception(512, 160, 112, 224, 24, 64, 64)
+        self.c4 = Inception(512, 128, 128, 256, 24, 64, 64)
+        self.d4 = Inception(512, 112, 144, 288, 32, 64, 64)
+        self.e4 = Inception(528, 256, 160, 320, 32, 128, 128)
+
+        # 第五层 
+        self.a5 = Inception(832, 256, 160, 320, 32, 128, 128)
+        self.b5 = Inception(832, 384, 192, 384, 48, 128, 128)
+
+        self.cbam1 = CBAM_block(192, 256)
+        self.cbam2 = CBAM_block(256, 480)
+        self.cbam3 = CBAM_block(480, 512)
+        self.cbam4 = CBAM_block(512, 512)
+        self.cbam5 = CBAM_block(512, 512)
+        self.cbam6 = CBAM_block(512, 528)
+        self.cbam7 = CBAM_block(528, 832)
+        self.cbam8 = CBAM_block(832, 832)
+        self.cbam9 = CBAM_block(832, 1024)
+
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout2d(p=0.4)
+        self.linear = nn.Linear(1024, num_class)
+
+    def forward(self, x):
+        x = self.prelayer(x)
+
+        cbam1 = self.cbam1(x)
+        x = self.a3(x)
+        x = x + cbam1
+        cbam2 = self.cbam2(x)
+        x = self.b3(x)
+        x = x + cbam2
+        x = self.maxpool(x)
+
+        cbam3 = self.cbam3(x)
+        x = self.a4(x)
+        x = x + cbam3
+        cbam4 = self.cbam4(x)
+        x = self.b4(x)
+        x = x + cbam4
+        cbam5 = self.cbam5(x)
+        x = self.c4(x)
+        x = x + cbam5
+        cbam6 = self.cbam6(x)
+        x = self.d4(x)
+        x = x + cbam6
+        cbam7 = self.cbam7(x)
+        x = self.e4(x)
+        x = x + cbam7
+        x = self.maxpool(x)
+
+        cbam8 = self.cbam8(x)
+        x = self.a5(x)
+        x = x + cbam8
+        cbam9 = self.cbam9(x)
+        x = self.b5(x)
+        x = x + cbam9
+
+        x = self.avgpool(x)
+        x = self.dropout(x)
+        x = x.view(x.size()[0], -1)
+        x = self.linear(x)
+
+        return x
+
+
+if __name__ == '__main__':
+    net = DCR_Inception()
+    x = torch.ones((1, 3, 96, 96))
+    output = net(x)
+    print(output.shape)
+    net.cuda()
+    summary(net, (3, 96, 96))
